@@ -1,0 +1,480 @@
+---
+title: "Attendance Modeling"
+output: html_document
+---
+
+```{r include = F}
+# Set up
+library(tidyverse)
+library(prophet)
+library(lubridate)
+library(randomForest)
+library(caret)
+library(xgboost)
+
+attendance_raw <- read_csv("attendance_modeling.csv")
+
+```
+
+
+```{r include = F}
+# Prepare Data for splitting into test/train
+att_mod_red <- attendance_raw %>%
+  select(attendance, teams.home.team.name, teams.away.team.name, temperature,
+         opener, dayNight, weekday, teams.home.leagueRecord.pct, teams.away.leagueRecord.pct,
+         team.home.one.behind.win.pct, team.away.one.behind.win.pct,
+         team.home.two.behind.win.pct, team.away.two.behind.win.pct,
+         teams.home.seriesNumber,
+         other_weather) %>%
+  unclass() %>%
+  as.data.frame()
+
+# Make series number a factor as a proxy for time of year
+att_mod_red$teams.home.seriesNumber <- cut(att_mod_red$teams.home.seriesNumber, breaks = seq(from = 0, to = 55, by = 5))
+
+# Make variable names easier for display purposes
+colnames(att_mod_red) <- c("Attendance",
+                           "Home.Team.Name",
+                           "Away.Team.Name",
+                           "Temperature",
+                           "Opening.Day",
+                           "Game.Time",
+                           "Day.of.Week",
+                           "Home.Team.Current.Winning.Percentage",
+                           "Away.Team.Current.Winning.Percentage",
+                           "Home.Team.Previous.Season.Winning.Percentage",
+                           "Away.Team.Previous.Season.Winning.Percentage",
+                           "Home.Team.Winning.Percentage.Two.Years.Prior",
+                           "Away.Team.Winning.Percentage.Two.Years.Prior",
+                           "Series.Number",
+                           "Weather")
+
+```
+
+```{r include = F}
+## Create training and testing data frames
+# Set seed for reproducibility
+set.seed(1842)
+# Get 80% of the rows to use as the training set
+n <- nrow(att_mod_red)
+train_n <- sample.int(n, .8*n)
+
+# Create the test/train sets
+att_train <- att_mod_red[train_n,]
+att_test <- att_mod_red[-train_n,]
+```
+
+## Create a Linear Model to Fit the Data
+```{r include = F}
+### Create linear model baseline and check assumptions
+# Create Linear model
+mod.lm <- lm(data = att_train, Attendance~.)
+
+# Use AIC for model selection
+lm.aic <- MASS::stepAIC(mod.lm, direction = "both")
+
+# Check fastbw for model selection
+rms::fastbw(rms::ols(data = att_train, Attendance~.), rule = "p", sls = .05)
+### Looks like we should keep all variables
+# Get predictions for the linear model
+predict.lm <- predict(mod.lm, newdata = att_test[,-1])
+
+```
+
+### Test the Linear Model Assumptions
+
+
+Test for Heteroscedasticity
+
+```{r echo = F}
+#### Check linear model assumptions
+### Check for heteroscedasticity (constant error variance)
+plot(mod.lm$fitted.values, mod.lm$residuals)
+## It appears that heteroscedasticity may be present
+
+
+```
+
+
+It appears that heteroscedasticity may be present
+
+Run Stastistical test for heteroscedasticity
+```{r echo = F}
+
+# Check with the Breush Pagan Test
+lmtest::bptest(mod.lm)
+## Yup, definitely present
+
+```
+
+It is definitely present 
+
+
+
+See if the response variable, attendance, can be transformed to eliminate heteroscedasticity
+```{r echo = F}
+
+### See if we can transform attendance
+caret::BoxCoxTrans(att_train$Attendance)
+
+# Show plot for llambda
+bc <- MASS::boxcox(mod.lm, plotit = T)
+## However lambda is very close to 1
+```
+
+Lambda is 1, indicating that there is no easy modification to the response variable to eliminate heteroscedasticity
+
+
+### Check for normally distributed errors
+```{r echo = F}
+### Check for normally distributed errors
+qqnorm(mod.lm$residuals)
+qqline(mod.lm$residuals, col = "blue")
+# Definitely not normally distributed
+```
+
+ The errors are not normally distributed 
+
+
+### Check for correlation of errors
+```{r echo = F}
+### Check for error correlation
+plot(mod.lm$residuals[1:(length(mod.lm$residuals)-1)],
+     mod.lm$residuals[2:(length(mod.lm$residuals))])
+
+lmtest::dwtest(mod.lm)
+## It appears that the errors are at least uncorrelated
+
+```
+At least the errors are uncorrelated
+
+
+```{r include = F}
+# Set control for training using 5-fold cross validation
+fitControl <- trainControl(method = "cv",
+                           number = 5)
+
+```
+
+
+
+
+
+## Create and Tune a Random Forest Model
+
+Initalize the model and test first parameters
+```{r echo = F}
+# Create random forest model
+# set.seed(1842)
+# rf_fit <- train(Attendance~.,
+#                   data = att_train,
+#                   method = "ranger",
+#                   metric = "RMSE",
+#                   trControl = fitControl,
+#                   tuneGrid = expand.grid(.mtry = 3:6,
+#                                          .splitrule = c("variance", "extratrees", "maxstat"),
+#                                          .min.node.size = c(3,5,7,9,11)))
+# save(rf_fit, file = "rf_5cv.RData")
+load("rf_5cv.RData")
+plot(rf_fit)
+# appears best when min.node.size is 3, mtry is 6, and the split rule is variance
+```
+
+
+It appears best when min.node.size is 3, mtry is 6, and the split rule is variance
+
+Further tune the model 
+```{r echo = F}
+## Further improve the RF model
+# set.seed(1842)
+# rf_fit2 <- train(Attendance~.,
+#                   data = att_train,
+#                   method = "ranger",
+#                   metric = "RMSE",
+#                   trControl = fitControl,
+#                   tuneGrid = expand.grid(.mtry = 7:14,
+#                                          .splitrule = c("variance"),
+#                                          .min.node.size = c(1,2,3)))
+#save(rf_fit2, file = "rf_5cv2.RData")
+load("rf_5cv2.RData")
+plot(rf_fit2)
+
+```
+
+The optimal parameters are using an mtry of 14, splitrule of variance, and min node size of 2
+
+## Create and Tune an XGBoost Linear Model
+
+Find the optimal number for nrounds
+
+```{r echo = F}
+# 
+ # set.seed(1842)
+ # xgbl_fit <- train(Attendance~.,
+ #               data = att_train,
+ #               method = "xgbLinear",
+ #               trControl = fitControl,
+ #               tuneGrid = expand.grid(.nrounds = c(100,150,200, 500, 1000),
+ #                                      .lambda = 0,
+ #                                      .alpha = 0,
+ #                                      .eta = c(.3)))
+#save(xgbl_fit, file = "xgb_liner_5cv.RData")
+
+load("xgb_liner_5cv.RData")
+plot(xgbl_fit)
+```
+
+It looks like nrounds 200 is best
+
+Fix nrounds and find optimal values for lambda and alpha
+
+```{r echo = F}
+# set.seed(1842)
+# xgbl_fit2 <- train(Attendance~.,
+#                data = att_train,
+#                method = "xgbLinear",
+#                metric = "RMSE",
+#                trControl = fitControl,
+#                tuneGrid = expand.grid(.nrounds = 200,
+#                                       .lambda = c(.0001, .001, .01, .1, .5, 1),
+#                                       .alpha = c(.0001, .001, .01, .1, .5, 1),
+#                                       .eta = c(.3)))
+# save(xgbl_fit2, file = "xgb_liner_5cv2.RData")
+
+
+load("xgb_liner_5cv2.RData")
+plot(xgbl_fit2)
+```
+
+The best values for lambda and alpha both are 1
+
+Find optimal eta value and search for a more prescise value for nrounds
+
+```{r echo = F}
+# set.seed(1842)
+# xgbl_fit3 <- train(Attendance~.,
+#                data = att_train,
+#                method = "xgbLinear",
+#                metric = "RMSE",
+#                trControl = fitControl,
+#                tuneGrid = expand.grid(.nrounds = c(100, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500),
+#                                       .lambda = 1,
+#                                       .alpha = 1,
+#                                       .eta = c(.01, .1, .3, .5, 1, 2)))
+# save(xgbl_fit3, file = "xgb_liner_5cv3.RData")
+load("xgb_liner_5cv3.RData")
+xgbl_fit3
+plot(xgbl_fit3)
+```
+
+The final parameters for the XGBoost model is lambda = 1, alpha = 1, nrounds = 275, eta = .01
+
+
+# Tune the XGBoost Tree Model
+(Step through each parameter individually due to processing time)
+
+Find the optimal number of rounds
+
+```{r echo = F}
+
+# set.seed(1842)
+# xgbt_fit <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = c(100,150,200, 500, 1000, 1500, 2000, 3000),
+#                                       .max_depth = 5,
+#                                       .eta = .1,
+#                                       .gamma = 0,
+#                                       .colsample_bytree = .8,
+#                                       .min_child_weight = 1,
+#                                       .subsample = .8))
+# save(xgbt_fit, file = "xgb_tree_5cv.RData")
+load("xgb_tree_5cv.RData")
+plot(xgbt_fit)
+
+```
+
+Optimal nrounds is 1500
+
+Find the optimal value of max_depth, the maximum depth of each tree
+
+```{r echo = F}
+# set.seed(1842)
+# 
+# xgbt_fit2 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = c(4, 5, 6, 7, 8),
+#                                       .eta = .1,
+#                                       .gamma = 0,
+#                                       .colsample_bytree = .8,
+#                                       .min_child_weight = 1,
+#                                       .subsample = .8))
+#save(xgbt_fit2, file = "xgb_tree_5cv2.RData")
+load("xgb_tree_5cv2.RData")
+plot(xgbt_fit2)
+```
+
+The optimal number for max tree depth is 6
+
+Find the optimal value of min_child_weight, the threshold for stopping to try new nodes
+
+```{r echo = F}
+# set.seed(1842)
+# xgbt_fit3 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = 6,
+#                                       .eta = .1,
+#                                       .gamma = 0,
+#                                       .colsample_bytree = .8,
+#                                       .min_child_weight = c(1,2,3,4,5),
+#                                       .subsample = .8))
+# save(xgbt_fit3, file = "xgb_tree_5cv3.RData")
+
+load("xgb_tree_5cv3.RData")
+plot(xgbt_fit3)
+
+```
+
+Optimal number for min child weight is 1
+
+
+Tune subsample
+
+```{r echo = F}
+# set.seed(1842)
+# xgbt_fit4 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = 6,
+#                                       .eta = .1,
+#                                       .gamma = 0,
+#                                       .colsample_bytree = .8,
+#                                       .min_child_weight = 1,
+#                                       .subsample = c(.5, .6, .7, .8, .9, 1)))
+# save(xgbt_fit4, file = "xgb_tree_5cv4.RData")
+load("xgb_tree_5cv4.RData")
+plot(xgbt_fit4)
+
+```
+
+Optimal number for subsample is 1
+
+
+Tune colsample_bytree
+
+```{r echo = F}
+# set.seed(1842)
+# xgbt_fit5 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = 6,
+#                                       .eta = .1,
+#                                       .gamma = 0,
+#                                       .colsample_bytree = c(.4, .5, .6, .7, .8),
+#                                       .min_child_weight = 1,
+#                                       .subsample = 1))
+# 
+# save(xgbt_fit5, file = "xgb_tree_5cv5.RData")
+load("xgb_tree_5cv5.RData")
+plot(xgbt_fit5)
+```
+
+Optimal number for colsample by tree is .5
+
+
+Tune gamma, minimum loss reduction required to makes further partitions on a leaf node
+
+```{r echo = F}
+# set.seed(1842)
+# xgbt_fit6 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = 6,
+#                                       .eta = .1,
+#                                       .gamma = c(0, 5, 10, 15, 20, 25, 30),
+#                                       .colsample_bytree = .5,
+#                                       .min_child_weight = 1,
+#                                       .subsample = 1))
+# save(xgbt_fit6, file = "xgb_tree_5cv6.RData")
+load("xgb_tree_5cv6.RData")
+plot(xgbt_fit6)
+
+```
+
+Optimal number for gamma is 0
+
+
+Find optimal value for eta
+
+```{r echo = F}
+# set.seed(1842)
+# xgbt_fit7 <- train(Attendance~.,
+#               data = att_train,
+#               method = "xgbTree",
+#               metric = "RMSE",
+#               trControl = trainControl(method = "cv",
+#                            number = 5),
+#               tuneGrid = expand.grid(.nrounds = 1500,
+#                                       .max_depth = 6,
+#                                       .eta = c(.01, .025, .05, .08, .1),
+#                                       .gamma = 0,
+#                                       .colsample_bytree = .5,
+#                                       .min_child_weight = 1,
+#                                       .subsample = .8))
+# save(xgbt_fit7, file = "xgb_tree_5cv7.RData")
+load("xgb_tree_5cv7.RData")
+plot(xgbt_fit7)
+
+```
+
+Optimal value for eta is .05, the final values for the model are nrounds = 1500, max_depth = 6, eta = 0.05, gamma = 0, colsample_bytree = 0.5, min_child_weight = 1 and subsample = 0.8.
+
+
+
+## Tune GLM Model
+```{r echo = F}
+# set.seed(1842)
+# glm_fit <- train(Attendance~.,
+#                    data = att_train,
+#                    method = "glmnet",
+#                    metric = "RMSE",
+#                    trControl = fitControl,
+#                    tuneGrid = expand.grid(.alpha =c(.6, .7, .8, .9,  1),
+#                                            .lambda = c(0, .0001, .001, .01, .1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20)))
+# save(glm_fit, file = "glmnet_5cv.RData")
+load("glmnet_5cv.RData")
+plot(glm_fit)
+
+```
+
+Optimal values for the GLM model is alpha = 1, lambda = 1 
+
+
+
+
+
